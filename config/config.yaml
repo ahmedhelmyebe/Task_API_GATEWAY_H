@@ -1,0 +1,48 @@
+# Parent → child nested configuration for the API Gateway
+server:
+  host: 127.0.0.1
+  port: 8080
+  cors:
+    allowed_origins: ["*"]
+    allowed_methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"]
+    allowed_headers: ["Authorization", "Content-Type", "X-Request-Id"]
+    allow_credentials: true
+  timeouts:
+    read_ms: 5000
+    read_header_ms: 3000
+    write_ms: 10000
+    idle_ms: 60000
+
+security:
+  jwt:
+    issuer: "api-gateway"
+    audience: "api-clients"
+    secret: "dev-change-me"   # override with env JWT_SECRET in production
+    ttl_minutes: 60
+    refresh_ttl_minutes: 10080  # 7 days
+
+rate_limit:
+  enabled: true
+  strategy: memory        # memory | redis
+  requests_per_minute: 60 # tokens added per minute
+  burst: 30               # bucket size
+
+redis:
+  mode: standalone        # standalone | sentinel
+  addresses: ["localhost:6379"]
+  master_name: "mymaster" # used only for sentinel
+  db: 0
+  username: ""
+  password: ""
+  tls: false
+
+database:
+  driver: mysql          # sqlite | mysql | postgres
+  dsn: "root:root@tcp(127.0.0.1:3306)/TestTaskOne?parseTime=true&loc=Local" # MySQL DSN.
+  # mysql example: "user:pass@tcp(localhost:3306)/app?parseTime=true&charset=utf8mb4,utf8"
+  # postgres example: "host=localhost user=app password=pass dbname=app port=5432 sslmode=disable"
+
+logging:
+  level: debug
+  json: true
+  sampling: true

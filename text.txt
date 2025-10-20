@@ -1,0 +1,1575 @@
+# go.mod
+
+```go
+module example.com/api-gateway
+
+go 1.22.0
+
+require (
+	github.com/gin-gonic/gin v1.10.0 // HTTP framework
+	github.com/golang-jwt/jwt/v5 v5.2.1 // JWT auth
+	github.com/go-playground/validator/v10 v10.21.0 // DTO validation
+	go.uber.org/zap v1.27.0 // structured logging
+	golang.org/x/crypto v0.28.0 // bcrypt
+	github.com/redis/go-redis/v9 v9.5.3 // Redis client (standalone + sentinel)
+	gorm.io/gorm v1.25.9 // ORM
+	gorm.io/driver/sqlite v1.5.7 // SQLite adapter
+	gorm.io/driver/mysql v1.5.7 // MySQL adapter
+	gorm.io/driver/postgres v1.5.9 // Postgres adapter
+	github.com/google/uuid v1.6.0 // request IDs
+	github.com/prometheus/client_golang v1.19.0 // optional metrics
+)
+```
+
+---
+
+# cmd/gateway/main.go
+
+```go
+package main // Entry point package
+
+import ( // Standard + project imports
+	"context" // For timeouts and cancelation
+	"fmt"     // Formatting strings (e.g., bind address)
+	"net/http" // HTTP server
+	"os"       // For env vars
+	"time"     // For server timeouts
+
+	"example.com/api-gateway/config" // Config loader
+	"example.com/api-gateway/internal/http" // Router
+	"example.com/api-gateway/internal/logger" // Zap logger init
+	"example.com/api-gateway/internal/redis" // Redis client init
+	"example.com/api-gateway/internal/repository" // Repo interfaces + adapters
+	"example.com/api-gateway/internal/rate" // Rate limiter impls
+	"example.com/api-gateway/internal/service" // Services (auth/user)
+
+	"go.uber.org/zap" // Logger type
+)
+
+func main() { // Orchestrates bootstrap and server run
+	// 1) Load configuration (env overrides handled in loader)
+	cfg, err := config.Load() // Reads config/config.yaml + env overrides
+	if err != nil {
+		panic(fmt.Errorf("failed to load config: %w", err)) // Fail fast if config invalid
+	}
+
+	// 2) Initialize logger with level/JSON/sampling as per config
+	log := logger.New(cfg.Logging) // Build *zap.Logger
+	defer log.Sync()               // Flush logs on exit
+
+	// 3) Initialize optional Redis (for rate-limiter) if enabled in config
+	var redisClient redis.Client // Interface (nil if not used)
+	if cfg.RateLimit.Enabled && cfg.RateLimit.Strategy == "redis" { // Only if redis strategy chosen
+		client, rErr := redis.NewClient(cfg.Redis, log) // Create (standalone or sentinel)
+		if rErr != nil {
+			log.Fatal("redis init failed", zap.Error(rErr)) // Production: no silent fallback here
+		}
+		redisClient = client // Keep for limiter wiring
+	}
+
+	// 4) Initialize repositories based on database driver
+	userRepo, dErr := repository.NewUserRepository(cfg.Database, log) // Switchable by config
+	if dErr != nil {
+		log.Fatal("db init failed", zap.Error(dErr)) // Fail if DB broken
+	}
+
+	// 5) Initialize services (business logic)
+	userSvc := service.NewUserService(userRepo, log) // CRUD + rules
+	authSvc := service.NewAuthService(userRepo, cfg.Security.JWT, log) // Login/JWT
+
+	// 6) Initialize the rate limiter implementation
+	var limiter rate.Limiter // Interface: Allow(key) -> (bool, retryAfter)
+	if cfg.RateLimit.Enabled { // Only build if enabled
+		if cfg.RateLimit.Strategy == "redis" {
+			limiter = rate.NewRedisLimiter(redisClient, cfg.RateLimit, log) // Shared across workers
+		} else {
+			limiter = rate.NewMemoryLimiter(cfg.RateLimit, log) // In-process token bucket
+		}
+	}
+
+	// 7) Build the HTTP router with all middlewares and handlers
+	r := httpx.NewRouter(cfg, log, authSvc, userSvc, limiter) // httpx = internal/http
+
+	// 8) Build server with timeouts
+	srv := &http.Server{ // Production timeouts to avoid Slowloris
+		Addr:              fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
+		Handler:           r, // Gin router as handler
+		ReadTimeout:       time.Duration(cfg.Server.Timeouts.ReadMS) * time.Millisecond,
+		ReadHeaderTimeout: time.Duration(cfg.Server.Timeouts.ReadHeaderMS) * time.Millisecond,
+		WriteTimeout:      time.Duration(cfg.Server.Timeouts.WriteMS) * time.Millisecond,
+		IdleTimeout:       time.Duration(cfg.Server.Timeouts.IdleMS) * time.Millisecond,
+	}
+
+	// 9) Start server (blocking)
+	log.Info("http server starting", zap.String("addr", srv.Addr))
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatal("server failed", zap.Error(err)) // Crash on unexpected error
+	}
+
+	// 10) Graceful shutdown example (not used with plain ListenAndServe). Left for reference.
+	_ = os.Setenv("_", "") // no-op to silence unused import if you later switch to graceful shutdown
+	_ = context.Background() // placeholder to indicate where shutdown ctx would live
+}
+```
+
+---
+
+# config/config.go
+
+```go
+package config // Centralized configuration types + loader
+
+import (
+	"fmt"      // For formatted errors
+	"os"       // For env overrides
+	"strings"  // Utility for parsing lists
+
+	"gopkg.in/yaml.v3" // YAML parsing
+)
+
+// Root holds the entire configuration tree in parent→child nesting.
+type Root struct {
+	Server    Server    `yaml:"server"`    // HTTP server options
+	Security  Security  `yaml:"security"`  // Auth and JWT
+	RateLimit RateLimit `yaml:"rate_limit"` // Rate limiting configuration
+	Redis     Redis     `yaml:"redis"`     // Redis modes + credentials
+	Database  Database  `yaml:"database"`  // DB driver + DSN/config
+	Logging   Logging   `yaml:"logging"`   // Zap logging
+}
+
+// Server groups HTTP listen + CORS + timeouts.
+type Server struct {
+	Host     string   `yaml:"host"`
+	Port     int      `yaml:"port"`
+	CORS     CORS     `yaml:"cors"`
+	Timeouts Timeouts `yaml:"timeouts"`
+}
+
+// CORS defines cross-origin allowlist and methods.
+type CORS struct {
+	AllowedOrigins []string `yaml:"allowed_origins"`
+	AllowedMethods []string `yaml:"allowed_methods"`
+	AllowedHeaders []string `yaml:"allowed_headers"`
+	AllowCredentials bool   `yaml:"allow_credentials"`
+}
+
+// Timeouts for HTTP server.
+type Timeouts struct {
+	ReadMS       int `yaml:"read_ms"`
+	ReadHeaderMS int `yaml:"read_header_ms"`
+	WriteMS      int `yaml:"write_ms"`
+	IdleMS       int `yaml:"idle_ms"`
+}
+
+// Security holds JWT settings.
+type Security struct {
+	JWT JWT `yaml:"jwt"`
+}
+
+// JWT settings.
+type JWT struct {
+	Issuer     string `yaml:"issuer"`
+	Audience   string `yaml:"audience"`
+	Secret     string `yaml:"secret"`      // May be overridden by env JWT_SECRET
+	TTLMinutes int    `yaml:"ttl_minutes"`
+	RefreshTTL int    `yaml:"refresh_ttl_minutes"`
+}
+
+// RateLimit config supports memory or redis.
+type RateLimit struct {
+	Enabled            bool   `yaml:"enabled"`
+	Strategy           string `yaml:"strategy"` // memory|redis
+	RequestsPerMinute  int    `yaml:"requests_per_minute"`
+	Burst              int    `yaml:"burst"`
+}
+
+// Redis supports standalone or sentinel modes.
+type Redis struct {
+	Mode       string   `yaml:"mode"` // standalone|sentinel
+	Addresses  []string `yaml:"addresses"` // host:port list (or sentinel nodes)
+	MasterName string   `yaml:"master_name"` // sentinel master logical name
+	DB         int      `yaml:"db"`
+	Username   string   `yaml:"username"`
+	Password   string   `yaml:"password"`
+	TLS        bool     `yaml:"tls"`
+}
+
+// Database driver selection + DSN per driver.
+type Database struct {
+	Driver string `yaml:"driver"` // mysql|postgres|sqlite
+	DSN    string `yaml:"dsn"`    // DSN string per driver
+}
+
+// Logging config for zap.
+type Logging struct {
+	Level    string `yaml:"level"` // debug|info|warn|error
+	JSON     bool   `yaml:"json"`
+	Sampling bool   `yaml:"sampling"`
+}
+
+// Load reads config/config.yaml, applies env overrides, and returns Root.
+func Load() (Root, error) {
+	var cfg Root // Holder
+
+	raw, err := os.ReadFile("config/config.yaml") // Read YAML file
+	if err != nil {
+		return cfg, fmt.Errorf("read config: %w", err) // File missing or unreadable
+	}
+	if err := yaml.Unmarshal(raw, &cfg); err != nil { // Parse YAML
+		return cfg, fmt.Errorf("parse config: %w", err)
+	}
+
+	// Env overrides (minimal: JWT_SECRET)
+	if s := os.Getenv("JWT_SECRET"); s != "" {
+		cfg.Security.JWT.Secret = s // Override secret from environment
+	}
+	// Optional: allow comma-separated CORS origins via env CORS_ORIGINS
+	if o := os.Getenv("CORS_ORIGINS"); o != "" {
+		cfg.Server.CORS.AllowedOrigins = strings.Split(o, ",")
+	}
+	return cfg, nil // Ready to use
+}
+```
+
+---
+
+# config/config.yaml
+
+```yaml
+# Parent → child nested configuration for the API Gateway
+server:
+  host: 0.0.0.0
+  port: 8080
+  cors:
+    allowed_origins: ["*"]
+    allowed_methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"]
+    allowed_headers: ["Authorization", "Content-Type", "X-Request-Id"]
+    allow_credentials: true
+  timeouts:
+    read_ms: 5000
+    read_header_ms: 3000
+    write_ms: 10000
+    idle_ms: 60000
+
+security:
+  jwt:
+    issuer: "api-gateway"
+    audience: "api-clients"
+    secret: "dev-change-me"   # override with env JWT_SECRET in production
+    ttl_minutes: 60
+    refresh_ttl_minutes: 10080  # 7 days
+
+rate_limit:
+  enabled: true
+  strategy: memory        # memory | redis
+  requests_per_minute: 60 # tokens added per minute
+  burst: 30               # bucket size
+
+redis:
+  mode: standalone        # standalone | sentinel
+  addresses: ["localhost:6379"]
+  master_name: "mymaster" # used only for sentinel
+  db: 0
+  username: ""
+  password: ""
+  tls: false
+
+database:
+  driver: sqlite          # sqlite | mysql | postgres
+  dsn: "file:./data/app.db?_busy_timeout=5000&_fk=1" # sqlite DSN example
+  # mysql example: "user:pass@tcp(localhost:3306)/app?parseTime=true&charset=utf8mb4,utf8"
+  # postgres example: "host=localhost user=app password=pass dbname=app port=5432 sslmode=disable"
+
+logging:
+  level: debug
+  json: true
+  sampling: true
+```
+
+---
+
+# internal/logger/logger.go
+
+```go
+package logger // Zap logger initialization
+
+import (
+	"strings"      // Normalize level
+	"go.uber.org/zap" // Zap logging
+	"go.uber.org/zap/zapcore" // Levels and config
+	"example.com/api-gateway/config" // Logging config type
+)
+
+// New builds a *zap.Logger from config.
+func New(cfg config.Logging) *zap.Logger {
+	lvl := zapcore.InfoLevel // default
+	switch strings.ToLower(cfg.Level) { // parse textual level
+	case "debug": lvl = zapcore.DebugLevel
+	case "info": lvl = zapcore.InfoLevel
+	case "warn": lvl = zapcore.WarnLevel
+	case "error": lvl = zapcore.ErrorLevel
+	}
+
+	zc := zap.NewProductionConfig() // start from production baseline
+	zc.Level = zap.NewAtomicLevelAt(lvl) // set level
+	zc.Encoding = func() string { if cfg.JSON { return "json" }; return "console" }() // encoding
+	if !cfg.Sampling { // disable sampler if requested
+		zc.Sampling = nil
+	}
+	logger, _ := zc.Build() // build logger (ignore minor error)
+	return logger
+}
+```
+
+---
+
+# internal/util/ctx.go
+
+```go
+package util // Small helpers for request context values
+
+import (
+	"context"
+)
+
+// Keys stored in context to avoid magic strings
+const (
+	CtxKeyRequestID = "req.id"
+	CtxKeyUserID    = "auth.sub"
+	CtxKeyUserRole  = "auth.role"
+)
+
+// With sets k=v in a context and returns child context.
+func With(ctx context.Context, k, v any) context.Context { return context.WithValue(ctx, k, v) }
+
+// Get pulls a value from context.
+func Get[T any](ctx context.Context, k any) (T, bool) { // generic getter
+	v, ok := ctx.Value(k).(T)
+	return v, ok
+}
+```
+
+---
+
+# internal/auth/password.go
+
+```go
+package auth // Password hashing helpers
+
+import "golang.org/x/crypto/bcrypt" // bcrypt implementation
+
+// Hash returns bcrypt hash for a plaintext password.
+func Hash(plain string) (string, error) { // cost default
+	b, err := bcrypt.GenerateFromPassword([]byte(plain), bcrypt.DefaultCost)
+	return string(b), err
+}
+
+// Verify compares plaintext with stored bcrypt hash.
+func Verify(hash, plain string) bool {
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(plain)) == nil
+}
+```
+
+---
+
+# internal/auth/jwt.go
+
+```go
+package auth // JWT issue/verify
+
+import (
+	"errors"       // For error values
+	"time"         // For exp/iat
+
+	"github.com/golang-jwt/jwt/v5" // JWT library
+	"example.com/api-gateway/config" // JWT config
+)
+
+// Claims represents our custom JWT claims.
+type Claims struct {
+	Sub  string `json:"sub"`  // user id
+	Role string `json:"role"` // user role (admin|user)
+	jwt.RegisteredClaims       // iss, aud, iat, exp
+}
+
+// Sign builds a signed token string using HS256.
+func Sign(c config.JWT, sub, role string) (string, error) {
+	now := time.Now()
+	claims := Claims{ // custom + registered
+		Sub:  sub,
+		Role: role,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    c.Issuer,
+			Audience:  jwt.ClaimStrings{c.Audience},
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(time.Duration(c.TTLMinutes) * time.Minute)),
+		},
+	}
+	t := jwt.NewWithClaims(jwt.SigningMethodHS256, claims) // HS256 token
+	return t.SignedString([]byte(c.Secret)) // HMAC sign
+}
+
+// Parse verifies signature and returns Claims.
+func Parse(c config.JWT, token string) (*Claims, error) {
+	parsed, err := jwt.ParseWithClaims(token, &Claims{}, func(t *jwt.Token) (any, error) {
+		if t.Method.Alg() != jwt.SigningMethodHS256.Alg() {
+			return nil, errors.New("unexpected alg")
+		}
+		return []byte(c.Secret), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	cl, ok := parsed.Claims.(*Claims)
+	if !ok || !parsed.Valid {
+		return nil, errors.New("invalid token")
+	}
+	return cl, nil
+}
+```
+
+---
+
+# internal/domain/user.go
+
+```go
+package domain // Core domain entity definitions
+
+import "time" // Timestamps
+
+// User is the aggregate root for identity and RBAC.
+type User struct {
+	ID           string    // UUID string
+	Name         string    // Display name
+	Email        string    // Unique email
+	PasswordHash string    // Bcrypt hash
+	Role         string    // admin|user
+	Active       bool      // Soft-active flag
+	CreatedAt    time.Time // Audit
+	UpdatedAt    time.Time // Audit
+}
+```
+
+---
+
+# internal/dto/auth_dto.go
+
+```go
+package dto // Request/response DTOs with validation tags
+
+// LoginRequest carries credentials.
+type LoginRequest struct {
+	Email    string `json:"email" validate:"required,email"`
+	Password string `json:"password" validate:"required,min=6"`
+}
+
+// LoginResponse returns a JWT.
+type LoginResponse struct {
+	Token string `json:"token"`
+}
+```
+
+---
+
+# internal/dto/user_dto.go
+
+```go
+package dto // User DTOs
+
+// CreateUserRequest for admin create.
+type CreateUserRequest struct {
+	Name     string `json:"name" validate:"required,min=2"`
+	Email    string `json:"email" validate:"required,email"`
+	Password string `json:"password" validate:"required,min=6"`
+	Role     string `json:"role" validate:"required,oneof=admin user"`
+}
+
+// UpdateUserRequest for patching fields.
+type UpdateUserRequest struct {
+	Name     *string `json:"name" validate:"omitempty,min=2"`
+	Password *string `json:"password" validate:"omitempty,min=6"`
+	Role     *string `json:"role" validate:"omitempty,oneof=admin user"`
+	Active   *bool   `json:"active"`
+}
+
+// UserResponse returned to clients (no password).
+type UserResponse struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Email  string `json:"email"`
+	Role   string `json:"role"`
+	Active bool   `json:"active"`
+}
+```
+
+---
+
+# internal/repository/user_repo.go
+
+```go
+package repository // Abstraction + constructors for adapters
+
+import (
+	"errors"
+	"fmt"
+
+	"example.com/api-gateway/config"
+	"example.com/api-gateway/internal/domain"
+	"go.uber.org/zap"
+)
+
+// UserRepository abstracts CRUD regardless of DB.
+type UserRepository interface {
+	Create(u *domain.User) error
+	GetByID(id string) (*domain.User, error)
+	GetByEmail(email string) (*domain.User, error)
+	List(offset, limit int) ([]domain.User, error)
+	Update(u *domain.User) error
+	Delete(id string) error
+}
+
+// NewUserRepository selects concrete adapter by cfg.Database.Driver.
+func NewUserRepository(dbCfg config.Database, log *zap.Logger) (UserRepository, error) {
+	switch dbCfg.Driver {
+	case "sqlite":
+		return NewGormRepo("sqlite", dbCfg.DSN, log)
+	case "mysql":
+		return NewGormRepo("mysql", dbCfg.DSN, log)
+	case "postgres":
+		return NewGormRepo("postgres", dbCfg.DSN, log)
+	default:
+		return nil, fmt.Errorf("unsupported driver: %s", dbCfg.Driver)
+	}
+}
+
+// ErrNotFound is returned when entity is missing.
+var ErrNotFound = errors.New("not found")
+```
+
+---
+
+# internal/repository/gorm_user_repo.go
+
+```go
+package repository // GORM-backed adapter (sqlite/mysql/postgres)
+
+import (
+	"errors"
+	"time"
+
+	"github.com/google/uuid"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+
+	"example.com/api-gateway/internal/domain"
+	"go.uber.org/zap"
+)
+
+// gormUser is the persistence model mapping to DB table.
+type gormUser struct {
+	ID           string `gorm:"primaryKey;size:36"`
+	Name         string
+	Email        string `gorm:"uniqueIndex"`
+	PasswordHash string
+	Role         string
+	Active       bool
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// toDomain converts persistence model to domain entity.
+func (g gormUser) toDomain() domain.User {
+	return domain.User{
+		ID:           g.ID,
+		Name:         g.Name,
+		Email:        g.Email,
+		PasswordHash: g.PasswordHash,
+		Role:         g.Role,
+		Active:       g.Active,
+		CreatedAt:    g.CreatedAt,
+		UpdatedAt:    g.UpdatedAt,
+	}
+}
+
+// fromDomain converts domain entity to persistence model.
+func fromDomain(u *domain.User) gormUser {
+	return gormUser{
+		ID:           u.ID,
+		Name:         u.Name,
+		Email:        u.Email,
+		PasswordHash: u.PasswordHash,
+		Role:         u.Role,
+		Active:       u.Active,
+		CreatedAt:    u.CreatedAt,
+		UpdatedAt:    u.UpdatedAt,
+	}
+}
+
+// gormRepo holds the DB connection.
+type gormRepo struct { db *gorm.DB }
+
+// NewGormRepo opens a GORM connection for the given driver and DSN.
+func NewGormRepo(driver, dsn string, log *zap.Logger) (*gormRepo, error) {
+	var dial gorm.Dialector
+	switch driver {
+	case "sqlite": dial = sqlite.Open(dsn)
+	case "mysql": dial = mysql.Open(dsn)
+	case "postgres": dial = postgres.Open(dsn)
+	default: return nil, errors.New("unsupported gorm driver")
+	}
+	db, err := gorm.Open(dial, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	if err != nil { return nil, err }
+	if err := db.AutoMigrate(&gormUser{}); err != nil { return nil, err }
+	return &gormRepo{db: db}, nil
+}
+
+// Create inserts a new user (assign UUID if missing).
+func (r *gormRepo) Create(u *domain.User) error {
+	if u.ID == "" { u.ID = uuid.NewString() }
+	if u.CreatedAt.IsZero() { u.CreatedAt = time.Now() }
+	u.UpdatedAt = time.Now()
+	gu := fromDomain(u)
+	return r.db.Create(&gu).Error
+}
+
+// GetByID fetches by primary key.
+func (r *gormRepo) GetByID(id string) (*domain.User, error) {
+	var gu gormUser
+	if err := r.db.First(&gu, "id = ?", id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) { return nil, ErrNotFound }
+		return nil, err
+	}
+	d := gu.toDomain()
+	return &d, nil
+}
+
+// GetByEmail fetches by unique email.
+func (r *gormRepo) GetByEmail(email string) (*domain.User, error) {
+	var gu gormUser
+	if err := r.db.First(&gu, "email = ?", email).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) { return nil, ErrNotFound }
+		return nil, err
+	}
+	d := gu.toDomain()
+	return &d, nil
+}
+
+// List returns users with simple paging.
+func (r *gormRepo) List(offset, limit int) ([]domain.User, error) {
+	var gus []gormUser
+	if err := r.db.Offset(offset).Limit(limit).Order("created_at DESC").Find(&gus).Error; err != nil {
+		return nil, err
+	}
+	out := make([]domain.User, 0, len(gus))
+	for _, g := range gus { out = append(out, g.toDomain()) }
+	return out, nil
+}
+
+// Update persists changes.
+func (r *gormRepo) Update(u *domain.User) error {
+	u.UpdatedAt = time.Now()
+	return r.db.Model(&gormUser{ID: u.ID}).Updates(fromDomain(u)).Error
+}
+
+// Delete removes by id.
+func (r *gormRepo) Delete(id string) error {
+	res := r.db.Delete(&gormUser{ID: id})
+	if res.Error != nil { return res.Error }
+	if res.RowsAffected == 0 { return ErrNotFound }
+	return nil
+}
+```
+
+---
+
+# internal/service/user_service.go
+
+```go
+package service // Business logic around users
+
+import (
+	"errors"
+
+	"example.com/api-gateway/internal/domain"
+	"example.com/api-gateway/internal/repository"
+	"go.uber.org/zap"
+)
+
+// UserService coordinates repo operations and invariants.
+type UserService struct {
+	repo repository.UserRepository
+	log  *zap.Logger
+}
+
+// NewUserService constructs the service.
+func NewUserService(r repository.UserRepository, l *zap.Logger) *UserService {
+	return &UserService{repo: r, log: l}
+}
+
+// Create creates a user, ensuring unique email is enforced at DB.
+func (s *UserService) Create(u *domain.User) error { return s.repo.Create(u) }
+
+// Get returns user by id.
+func (s *UserService) Get(id string) (*domain.User, error) { return s.repo.GetByID(id) }
+
+// GetByEmail returns user by email.
+func (s *UserService) GetByEmail(email string) (*domain.User, error) { return s.repo.GetByEmail(email) }
+
+// List pages users.
+func (s *UserService) List(offset, limit int) ([]domain.User, error) { return s.repo.List(offset, limit) }
+
+// Update updates fields.
+func (s *UserService) Update(u *domain.User) error { return s.repo.Update(u) }
+
+// Delete removes a user.
+func (s *UserService) Delete(id string) error { return s.repo.Delete(id) }
+
+// CanSelf checks if requester id matches target id.
+func (s *UserService) CanSelf(requesterID, targetID string) bool { return requesterID == targetID }
+
+// IsAdmin checks admin role.
+func (s *UserService) IsAdmin(role string) bool { return role == "admin" }
+
+// GuardSelfOrAdmin returns error if neither self nor admin.
+func (s *UserService) GuardSelfOrAdmin(requesterID, requesterRole, targetID string) error {
+	if s.IsAdmin(requesterRole) || s.CanSelf(requesterID, targetID) { return nil }
+	return errors.New("forbidden")
+}
+```
+
+---
+
+# internal/service/auth_service.go
+
+```go
+package service // Auth service combines repo + jwt + password
+
+import (
+	"errors"
+
+	"example.com/api-gateway/config"
+	"example.com/api-gateway/internal/auth"
+	"example.com/api-gateway/internal/domain"
+	"example.com/api-gateway/internal/repository"
+	"go.uber.org/zap"
+)
+
+// AuthService validates credentials and issues JWTs.
+type AuthService struct {
+	repo repository.UserRepository // read user by email
+	jwt  config.JWT                // signing config
+	log  *zap.Logger               // logger
+}
+
+// NewAuthService wires dependencies.
+func NewAuthService(r repository.UserRepository, jwtCfg config.JWT, l *zap.Logger) *AuthService {
+	return &AuthService{repo: r, jwt: jwtCfg, log: l}
+}
+
+// Login checks credentials and returns token string.
+func (s *AuthService) Login(email, password string) (string, *domain.User, error) {
+	u, err := s.repo.GetByEmail(email)
+	if err != nil { return "", nil, err }
+	if !u.Active { return "", nil, errors.New("inactive user") }
+	if !auth.Verify(u.PasswordHash, password) { return "", nil, errors.New("invalid credentials") }
+	tok, err := auth.Sign(s.jwt, u.ID, u.Role)
+	if err != nil { return "", nil, err }
+	return tok, u, nil
+}
+```
+
+---
+
+# internal/http/middleware/requestid.go
+
+```go
+package middleware // Request ID + correlation IDs
+
+import (
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+// RequestID injects an X-Request-Id if absent and exposes to handlers.
+func RequestID() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		reqID := c.GetHeader("X-Request-Id")
+		if reqID == "" { reqID = uuid.NewString() }
+		c.Writer.Header().Set("X-Request-Id", reqID)
+		c.Set("req.id", reqID)
+		c.Next()
+	}
+}
+```
+
+---
+
+# internal/http/middleware/auth.go
+
+```go
+package middleware // JWT authentication: parse + attach identity
+
+import (
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"example.com/api-gateway/config"
+	"example.com/api-gateway/internal/auth"
+)
+
+// Authenticated ensures valid JWT and stores sub/role in context.
+func Authenticated(jwtCfg config.JWT) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		h := c.GetHeader("Authorization")
+		if !strings.HasPrefix(h, "Bearer ") {
+			c.AbortWithStatusJSON(401, gin.H{"error": "authentication required", "code": "unauthorized"})
+			return
+		}
+		token := strings.TrimPrefix(h, "Bearer ")
+		claims, err := auth.Parse(jwtCfg, token)
+		if err != nil {
+			c.AbortWithStatusJSON(401, gin.H{"error": "invalid token", "code": "unauthorized"})
+			return
+		}
+		c.Set("auth.sub", claims.Sub)
+		c.Set("auth.role", claims.Role)
+		c.Next()
+	}
+}
+```
+
+---
+
+# internal/http/middleware/rbac.go
+
+```go
+package middleware // RBAC helpers for route protection
+
+import "github.com/gin-gonic/gin"
+
+// RequireAdmin allows only admin role.
+func RequireAdmin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if role, _ := c.Get("auth.role"); role == "admin" {
+			c.Next(); return
+		}
+		c.AbortWithStatusJSON(403, gin.H{"error": "admin only", "code": "forbidden"})
+	}
+}
+
+// RequireSelfOrAdmin checks path param :id against auth.sub
+func RequireSelfOrAdmin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		role, _ := c.Get("auth.role")
+		if role == "admin" { c.Next(); return }
+		sub, _ := c.Get("auth.sub")
+		if sub == c.Param("id") { c.Next(); return }
+		c.AbortWithStatusJSON(403, gin.H{"error": "forbidden: not owner", "code": "forbidden"})
+	}
+}
+```
+
+---
+
+# internal/rate/limiter.go
+
+```go
+package rate // Limiter interface and config shim
+
+import (
+	"time"
+	"example.com/api-gateway/config"
+	"go.uber.org/zap"
+)
+
+// Limiter decides if a key may proceed right now.
+type Limiter interface {
+	Allow(key string) (allowed bool, retryAfter time.Duration)
+}
+
+// Cfg is an alias to avoid importing config everywhere.
+type Cfg = config.RateLimit
+
+// Noop implements Limiter that always allows (unused, but handy for tests)
+type Noop struct{}
+
+func (Noop) Allow(string) (bool, time.Duration) { return true, 0 }
+
+// Common constructor helpers can accept zap logger for diagnostics.
+func NewLoggerTagged(l *zap.Logger, name string) *zap.Logger { return l.With(zap.String("limiter", name)) }
+```
+
+---
+
+# internal/rate/memory_limiter.go
+
+```go
+package rate // In-memory token bucket limiter
+
+import (
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+)
+
+// memoryLimiter holds buckets per key.
+type memoryLimiter struct {
+	mu     sync.Mutex
+	cfg    Cfg
+	buckets map[string]*bucket
+	log    *zap.Logger
+}
+
+// bucket stores token state.
+type bucket struct {
+	tokens     float64
+	lastRefill time.Time
+}
+
+// NewMemoryLimiter constructs the limiter.
+func NewMemoryLimiter(cfg Cfg, log *zap.Logger) Limiter {
+	return &memoryLimiter{cfg: cfg, buckets: make(map[string]*bucket), log: NewLoggerTagged(log, "memory")}
+}
+
+// Allow checks/updates tokens.
+func (m *memoryLimiter) Allow(key string) (bool, time.Duration) {
+	m.mu.Lock(); defer m.mu.Unlock()
+	b, ok := m.buckets[key]
+	if !ok { // create new bucket
+		b = &bucket{tokens: float64(m.cfg.Burst), lastRefill: time.Now()}
+		m.buckets[key] = b
+	}
+	// Refill proportional to elapsed time
+	elapsed := time.Since(b.lastRefill).Minutes()
+	refill := elapsed * float64(m.cfg.RequestsPerMinute) // tokens per minute
+	b.tokens = min(float64(m.cfg.Burst), b.tokens+refill)
+	b.lastRefill = time.Now()
+	if b.tokens >= 1 { // consume a token
+		b.tokens -= 1
+		return true, 0
+	}
+	// Not enough tokens -> compute retry-after until next token
+	need := 1 - b.tokens
+	perToken := time.Minute / time.Duration(max(1, m.cfg.RequestsPerMinute))
+	return false, time.Duration(need*float64(perToken))
+}
+
+func min(a, b float64) float64 { if a < b { return a }; return b }
+func max(a, b int) int { if a > b { return a }; return b }
+```
+
+---
+
+# internal/redis/client.go
+
+```go
+package redis // Client init for standalone or sentinel
+
+import (
+	"crypto/tls"
+
+	redis "github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
+	"example.com/api-gateway/config"
+)
+
+// Client is a thin alias to decouple imports.
+type Client = redis.UniversalClient
+
+// NewClient returns a universal client supporting standalone or sentinel.
+func NewClient(cfg config.Redis, log *zap.Logger) (Client, error) {
+	opt := &redis.UniversalOptions{ // works for single or sentinel
+		Addrs: cfg.Addresses,
+		DB:    cfg.DB,
+		Username: cfg.Username,
+		Password: cfg.Password,
+	}
+	if cfg.Mode == "sentinel" {
+		opt.MasterName = cfg.MasterName
+	}
+	if cfg.TLS { opt.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12} }
+	client := redis.NewUniversalClient(opt)
+	// quick health check
+	if _, err := client.Ping(client.Context()).Result(); err != nil {
+		log.Error("redis ping failed", zap.Error(err))
+		return nil, err
+	}
+	log.Info("redis connected", zap.Strings("addrs", cfg.Addresses), zap.String("mode", cfg.Mode))
+	return client, nil
+}
+```
+
+---
+
+# internal/rate/redis_limiter.go
+
+```go
+package rate // Redis-backed fixed-window-ish token bucket
+
+import (
+	"time"
+	"strconv"
+
+	"example.com/api-gateway/internal/redis"
+	"go.uber.org/zap"
+)
+
+// redisLimiter implements Limiter using Redis INCR + TTL.
+type redisLimiter struct {
+	c   redis.Client
+	cfg Cfg
+	log *zap.Logger
+}
+
+// NewRedisLimiter constructs the limiter.
+func NewRedisLimiter(c redis.Client, cfg Cfg, log *zap.Logger) Limiter {
+	return &redisLimiter{c: c, cfg: cfg, log: NewLoggerTagged(log, "redis")}
+}
+
+// Allow uses a per-minute key with burst windowing.
+func (r *redisLimiter) Allow(key string) (bool, time.Duration) {
+	ctx := r.c.Context()
+	bucketKey := "rl:" + key + ":" + time.Now().Format("200601021504") // YYYYMMDDHHmm
+	count, err := r.c.Incr(ctx, bucketKey).Result()
+	if err != nil { r.log.Warn("redis incr fail", zap.Error(err)); return true, 0 }
+	if count == 1 { _ = r.c.Expire(ctx, bucketKey, time.Minute).Err() }
+	if int(count) <= r.cfg.RequestsPerMinute + r.cfg.Burst { return true, 0 }
+	// compute seconds left in current minute
+	ttl, _ := r.c.TTL(ctx, bucketKey).Result()
+	if ttl < 0 { ttl = time.Second * 10 }
+	return false, ttl
+}
+```
+
+---
+
+# internal/http/middleware/ratelimit.go
+
+```go
+package middleware // Rate limit middleware wiring
+
+import (
+	"net"
+	"strconv"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"example.com/api-gateway/internal/rate"
+)
+
+// RateLimit creates a middleware using provided Limiter.
+// Key strategy: if auth.sub exists -> per-user; else per-IP.
+func RateLimit(limiter rate.Limiter, rpm int) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if limiter == nil { c.Next(); return }
+		key := clientIP(c)
+		if sub, ok := c.Get("auth.sub"); ok { key = sub.(string) }
+		allowed, retry := limiter.Allow(key)
+		remaining := "unknown" // memory limiter doesn't track, but we expose standard headers
+		c.Writer.Header().Set("X-RateLimit-Limit", strconv.Itoa(rpm))
+		c.Writer.Header().Set("X-RateLimit-Remaining", remaining)
+		if !allowed {
+			c.Writer.Header().Set("Retry-After", strconv.Itoa(int(retry.Round(time.Second).Seconds())))
+			c.AbortWithStatusJSON(429, gin.H{"error": "rate limit exceeded", "code": "too_many_requests"})
+			return
+		}
+		c.Next()
+	}
+}
+
+// clientIP extracts best-effort client IP.
+func clientIP(c *gin.Context) string {
+	ip := c.ClientIP()
+	if ip == "" { ip = "0.0.0.0" }
+	// Normalize IPv6-mapped IPv4
+	if parsed := net.ParseIP(ip); parsed != nil {
+		if v4 := parsed.To4(); v4 != nil { return v4.String() }
+	}
+	return ip
+}
+```
+
+---
+
+# internal/handlers/auth_handler.go
+
+```go
+package handlers // HTTP handlers for /auth
+
+import (
+	"github.com/gin-gonic/gin"
+	"github.com/go-playground/validator/v10"
+	"example.com/api-gateway/internal/dto"
+	"example.com/api-gateway/internal/service"
+)
+
+// AuthHandler exposes login endpoint.
+type AuthHandler struct {
+	v *validator.Validate
+	s *service.AuthService
+}
+
+// NewAuthHandler builds the handler.
+func NewAuthHandler(s *service.AuthService) *AuthHandler { return &AuthHandler{v: validator.New(), s: s} }
+
+// Login handles POST /auth/login.
+func (h *AuthHandler) Login(c *gin.Context) {
+	var req dto.LoginRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "invalid json"}); return
+	}
+	if err := h.v.Struct(req); err != nil {
+		c.JSON(422, gin.H{"error": err.Error()}); return
+	}
+	token, u, err := h.s.Login(req.Email, req.Password)
+	if err != nil { c.JSON(401, gin.H{"error": err.Error()}); return }
+	c.JSON(200, dto.LoginResponse{Token: token})
+	_ = u // could return user profile too if desired
+}
+```
+
+---
+
+# internal/handlers/user_handler.go
+
+```go
+package handlers // HTTP handlers for /users
+
+import (
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/go-playground/validator/v10"
+	"example.com/api-gateway/internal/auth"
+	"example.com/api-gateway/internal/domain"
+	"example.com/api-gateway/internal/dto"
+	"example.com/api-gateway/internal/service"
+)
+
+// UserHandler provides CRUD endpoints.
+type UserHandler struct {
+	v *validator.Validate
+	s *service.UserService
+}
+
+// NewUserHandler builds handler.
+func NewUserHandler(s *service.UserService) *UserHandler { return &UserHandler{v: validator.New(), s: s} }
+
+// List GET /users (admin only)
+func (h *UserHandler) List(c *gin.Context) {
+	users, err := h.s.List(0, 100)
+	if err != nil { c.JSON(500, gin.H{"error": err.Error()}); return }
+	out := make([]dto.UserResponse, 0, len(users))
+	for _, u := range users {
+		out = append(out, dto.UserResponse{ID: u.ID, Name: u.Name, Email: u.Email, Role: u.Role, Active: u.Active})
+	}
+	c.JSON(200, out)
+}
+
+// Create POST /users (admin only)
+func (h *UserHandler) Create(c *gin.Context) {
+	var req dto.CreateUserRequest
+	if err := c.ShouldBindJSON(&req); err != nil { c.JSON(400, gin.H{"error": "invalid json"}); return }
+	if err := h.v.Struct(req); err != nil { c.JSON(422, gin.H{"error": err.Error()}); return }
+	hash, _ := auth.Hash(req.Password)
+	u := &domain.User{ Name: req.Name, Email: req.Email, PasswordHash: hash, Role: req.Role, Active: true, CreatedAt: time.Now(), UpdatedAt: time.Now() }
+	if err := h.s.Create(u); err != nil { c.JSON(500, gin.H{"error": err.Error()}); return }
+	c.JSON(201, dto.UserResponse{ID: u.ID, Name: u.Name, Email: u.Email, Role: u.Role, Active: u.Active})
+}
+
+// Get GET /users/:id (admin or self)
+func (h *UserHandler) Get(c *gin.Context) {
+	id := c.Param("id")
+	u, err := h.s.Get(id)
+	if err != nil { c.JSON(404, gin.H{"error": "not found"}); return }
+	c.JSON(200, dto.UserResponse{ID: u.ID, Name: u.Name, Email: u.Email, Role: u.Role, Active: u.Active})
+}
+
+// Patch PATCH /users/:id (admin or self)
+func (h *UserHandler) Patch(c *gin.Context) {
+	id := c.Param("id")
+	var req dto.UpdateUserRequest
+	if err := c.ShouldBindJSON(&req); err != nil { c.JSON(400, gin.H{"error": "invalid json"}); return }
+	if err := h.v.Struct(req); err != nil { c.JSON(422, gin.H{"error": err.Error()}); return }
+	u, err := h.s.Get(id); if err != nil { c.JSON(404, gin.H{"error": "not found"}); return }
+	if req.Name != nil { u.Name = *req.Name }
+	if req.Password != nil { if h, _ := auth.Hash(*req.Password); *req.Password != "" { u.PasswordHash = h } }
+	if req.Role != nil { u.Role = *req.Role }
+	if req.Active != nil { u.Active = *req.Active }
+	if err := h.s.Update(u); err != nil { c.JSON(500, gin.H{"error": err.Error()}); return }
+	c.JSON(200, dto.UserResponse{ID: u.ID, Name: u.Name, Email: u.Email, Role: u.Role, Active: u.Active})
+}
+
+// Delete DELETE /users/:id (admin only)
+func (h *UserHandler) Delete(c *gin.Context) {
+	id := c.Param("id")
+	if err := h.s.Delete(id); err != nil { c.JSON(404, gin.H{"error": "not found"}); return }
+	c.Status(204)
+}
+
+// Me GET /users/me (self)
+func (h *UserHandler) Me(c *gin.Context) {
+	if sub, ok := c.Get("auth.sub"); ok {
+		if u, err := h.s.Get(sub.(string)); err == nil {
+			c.JSON(200, dto.UserResponse{ID: u.ID, Name: u.Name, Email: u.Email, Role: u.Role, Active: u.Active}); return
+		}
+	}
+	c.JSON(404, gin.H{"error": "not found"})
+}
+
+// PatchMe PATCH /users/me (self)
+func (h *UserHandler) PatchMe(c *gin.Context) {
+	sub, _ := c.Get("auth.sub")
+	id := sub.(string)
+	c.Params = append(c.Params, gin.Param{Key: "id", Value: id}) // reuse Patch logic by setting :id
+	h.Patch(c)
+}
+```
+
+---
+
+# internal/http/router.go
+
+```go
+package httpx // Router wiring (Gin)
+
+import (
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"example.com/api-gateway/config"
+	"example.com/api-gateway/internal/http/middleware"
+	"example.com/api-gateway/internal/service"
+	"example.com/api-gateway/internal/rate"
+	"go.uber.org/zap"
+)
+
+// NewRouter builds the full HTTP router with routes and middleware.
+func NewRouter(cfg config.Root, log *zap.Logger, authSvc *service.AuthService, userSvc *service.UserService, limiter rate.Limiter) *gin.Engine {
+	r := gin.New() // no default middleware
+	r.Use(gin.Recovery()) // recover from panics
+	r.Use(middleware.RequestID()) // add X-Request-Id
+	r.Use(requestLogger(log)) // simple structured request log
+	// CORS (minimal allow-all example; adapt for production)
+	r.Use(func(c *gin.Context) {
+		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-Id")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+		if c.Request.Method == http.MethodOptions { c.AbortWithStatus(204); return }
+		c.Next()
+	})
+
+	// Health & metrics
+	r.GET("/health", func(c *gin.Context) { c.JSON(200, gin.H{"status": "ok"}) })
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+
+	// Middlewares that depend on config
+	authRequired := middleware.Authenticated(cfg.Security.JWT)
+	rlmw := middleware.RateLimit(limiter, cfg.RateLimit.RequestsPerMinute)
+
+	// Auth routes
+	{
+		h := handlersFrom(authSvc, userSvc) // internal helper builds handlers
+		r.POST("/auth/login", rlmw, h.Auth.Login)
+	}
+
+	// Protected routes
+	{
+		h := handlersFrom(authSvc, userSvc)
+		grp := r.Group("/")
+		grp.Use(rlmw, authRequired)
+		// Users (admin only)
+		grp.GET("/users", middleware.RequireAdmin(), h.Users.List)
+		grp.POST("/users", middleware.RequireAdmin(), h.Users.Create)
+		grp.GET("/users/:id", middleware.RequireSelfOrAdmin(), h.Users.Get)
+		grp.PATCH("/users/:id", middleware.RequireSelfOrAdmin(), h.Users.Patch)
+		grp.DELETE("/users/:id", middleware.RequireAdmin(), h.Users.Delete)
+		// Self utilities
+		grp.GET("/users/me", h.Users.Me)
+		grp.PATCH("/users/me", h.Users.PatchMe)
+	}
+
+	return r
+}
+
+// small aggregate to pass both handlers
+type pair struct { Auth *handlers.AuthHandler; Users *handlers.UserHandler }
+
+func handlersFrom(a *service.AuthService, u *service.UserService) pair {
+	return pair{Auth: handlers.NewAuthHandler(a), Users: handlers.NewUserHandler(u)}
+}
+
+// requestLogger is a minimal structured access log middleware.
+func requestLogger(log *zap.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := gin.Now()
+		c.Next()
+		log.Info("http",
+			zap.String("id", c.GetString("req.id")),
+			zap.String("method", c.Request.Method),
+			zap.String("path", c.Request.URL.Path),
+			zap.Int("status", c.Writer.Status()),
+			zap.Duration("dur", gin.Now().Sub(start)),
+		)
+	}
+}
+```
+
+---
+
+# pkg/errors/errs.go
+
+```go
+package errors // Consistent error envelope helpers
+
+import "github.com/gin-gonic/gin"
+
+// JSON writes a standardized error object.
+func JSON(c *gin.Context, status int, code, msg string) {
+	c.JSON(status, gin.H{"error": msg, "code": code, "traceId": c.GetString("req.id")})
+}
+```
+
+---
+
+# Makefile
+
+```make
+SHELL := /bin/bash
+
+.PHONY: run test lint build docker
+
+run:
+	go run ./cmd/gateway
+
+test:
+	go test ./...
+
+lint:
+	@echo "(optional) integrate golangci-lint here"
+
+build:
+	go build -o bin/gateway ./cmd/gateway
+
+docker:
+	docker compose up --build
+```
+
+---
+
+# docker-compose.yml
+
+```yaml
+version: "3.9"
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - JWT_SECRET=dev-change-me
+    depends_on:
+      - sqlite
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+  sqlite:
+    image: keinos/sqlite3:3.46
+    command: ["tail", "-f", "/dev/null"]
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+```
+
+---
+
+# Dockerfile
+
+```dockerfile
+FROM golang:1.22-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o /out/gateway ./cmd/gateway
+
+FROM alpine:3.20
+WORKDIR /app
+COPY --from=build /out/gateway /app/gateway
+COPY config /app/config
+COPY data /app/data
+EXPOSE 8080
+ENV GIN_MODE=release
+CMD ["/app/gateway"]
+```
+
+---
+
+# test/auth_jwt_test.go
+
+```go
+package test
+
+import (
+	"testing"
+	"example.com/api-gateway/config"
+	"example.com/api-gateway/internal/auth"
+)
+
+func TestJWTSignParse(t *testing.T) {
+	cfg := config.JWT{Issuer: "iss", Audience: "aud", Secret: "s", TTLMinutes: 1}
+	tok, err := auth.Sign(cfg, "u1", "admin")
+	if err != nil { t.Fatal(err) }
+	cl, err := auth.Parse(cfg, tok)
+	if err != nil { t.Fatal(err) }
+	if cl.Sub != "u1" || cl.Role != "admin" { t.Fatalf("unexpected claims: %+v", cl) }
+}
+```
+
+---
+
+# test/memory_limiter_test.go
+
+```go
+package test
+
+import (
+	"testing"
+	"time"
+	"example.com/api-gateway/config"
+	"example.com/api-gateway/internal/rate"
+	"go.uber.org/zap"
+)
+
+func TestMemoryLimiter(t *testing.T) {
+	cfg := config.RateLimit{Enabled: true, Strategy: "memory", RequestsPerMinute: 2, Burst: 1}
+	l := rate.NewMemoryLimiter(cfg, zap.NewNop())
+	// 1st: allowed
+	if ok, _ := l.Allow("k"); !ok { t.Fatal("want allow #1") }
+	// 2nd: burst -> allowed
+	if ok, _ := l.Allow("k"); !ok { t.Fatal("want allow #2") }
+	// 3rd: should be denied
+	if ok, _ := l.Allow("k"); ok { t.Fatal("want deny #3") }
+	time.Sleep(time.Second * 31) // refill half a minute -> at least one token
+	if ok, _ := l.Allow("k"); !ok { t.Fatal("want allow after refill") }
+}
+```
+
+---
+
+# README.md
+
+````md
+# API Gateway (Go 1.22+, Gin, JWT) — Routing · Rate Limit · AuthN/Z
+
+Production‑minded starter that fronts a User Management domain with clean layering.
+
+## Features
+- **Routing** with Gin, request ID, access logs, CORS, health, metrics
+- **AuthN/Z** via JWT (HS256), RBAC (admin/user), self‑access enforcement
+- **Rate Limiting** per‑IP / per‑user (in‑memory token bucket or Redis)
+- **DB‑agnostic repos** via GORM (sqlite/mysql/postgres) selected from config
+- **Logging** with Zap (JSON, levels, sampling)
+
+## Run (Local)
+```bash
+# 1) Set JWT secret (override config)
+export JWT_SECRET=dev-change-me
+
+# 2) Start API
+go run ./cmd/gateway
+````
+
+## Run (Docker Compose)
+
+```bash
+docker compose up --build -d
+```
+
+## Login & Call Protected Routes
+
+Seed an admin manually (sqlite): open DB and insert a user with bcrypt hash.
+
+```sql
+-- Replace $HASH with output of `htpasswd -bnBC 10 '' admin | tr -d ':\n'` or use the app helpers.
+INSERT INTO gorm_users (id,name,email,password_hash,role,active,created_at,updated_at)
+VALUES ('admin-1','Admin','admin@example.com','$HASH','admin',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
+```
+
+Then:
+
+```bash
+# Login
+curl -sS -X POST http://localhost:8080/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"admin@example.com","password":"adminpass"}'
+# => {"token":"<JWT>"}
+
+# List users (admin)
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/users
+
+# Create user (admin)
+curl -X POST http://localhost:8080/users \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"U","email":"u@example.com","password":"secret12","role":"user"}'
+
+# As normal user
+curl -H "Authorization: Bearer $USER_TOKEN" http://localhost:8080/users/me
+curl -X PATCH -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"New"}' http://localhost:8080/users/me
+```
+
+## Switch DB Drivers
+
+In `config/config.yaml`:
+
+```yaml
+database:
+  driver: postgres
+  dsn: "host=localhost user=app password=pass dbname=app port=5432 sslmode=disable"
+```
+
+No code changes are required.
+
+## Redis Modes (Rate Limiter)
+
+In `config/config.yaml`:
+
+```yaml
+rate_limit:
+  enabled: true
+  strategy: redis
+redis:
+  mode: sentinel               # or standalone
+  addresses: ["10.0.0.10:26379","10.0.0.11:26379","10.0.0.12:26379"]
+  master_name: mymaster
+```
+
+## Testing
+
+```bash
+go test ./...
+```
+
+## Postman Collection (import JSON)
+
+```
+{
+  "info": {"name": "API Gateway", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+  "item": [
+    {"name":"Login","request":{"method":"POST","header":[{"key":"Content-Type","value":"application/json"}],"url":{"raw":"http://localhost:8080/auth/login","protocol":"http","host":["localhost"],"port":"8080","path":["auth","login"]},"body":{"mode":"raw","raw":"{\n  \"email\": \"admin@example.com\",\n  \"password\": \"adminpass\"\n}"}}},
+    {"name":"List Users (admin)","request":{"method":"GET","header":[{"key":"Authorization","value":"Bearer {{token}}"}],"url":{"raw":"http://localhost:8080/users","protocol":"http","host":["localhost"],"port":"8080","path":["users"]}}}
+  ],
+  "variable": [{"key": "token", "value": ""}]
+}
+```
+
+```
+```

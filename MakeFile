@@ -1,0 +1,24 @@
+SHELL := /bin/bash
+
+
+.PHONY: run test lint build docker
+
+
+run:
+go run ./cmd/gateway
+
+
+test:
+go test ./...
+
+
+lint:
+@echo "(optional) integrate golangci-lint here"
+
+
+build:
+go build -o bin/gateway ./cmd/gateway
+
+
+docker:
+docker compose up --build
