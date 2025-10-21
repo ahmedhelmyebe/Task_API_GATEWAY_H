@@ -1,3 +1,5 @@
+//Per-user (if logged) else per-IP.
+
 package middleware // Rate limit middleware wiring
 
 import (

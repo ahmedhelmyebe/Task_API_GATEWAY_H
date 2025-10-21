@@ -1,3 +1,4 @@
+// Ensure X-Request-Id.
 package middleware // Request ID + correlation IDs
 
 import (

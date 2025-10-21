@@ -1,3 +1,5 @@
+//returns JWT.
+
 package handlers // HTTP handlers for /auth
 
 import (
@@ -14,7 +16,11 @@ type AuthHandler struct {
 }
 
 // NewAuthHandler builds the handler.
-func NewAuthHandler(s *service.AuthService) *AuthHandler { return &AuthHandler{v: validator.New(), s: s} }
+func NewAuthHandler(s *service.AuthService) *AuthHandler { 
+	return &AuthHandler{
+		v: validator.New(),
+		 s: s}
+ }
 
 // Login handles POST /auth/login.
 func (h *AuthHandler) Login(c *gin.Context) {

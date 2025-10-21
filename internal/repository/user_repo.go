@@ -1,3 +1,5 @@
+//Repository interface + factory + ErrNotFound.
+
 package repository // Abstraction + constructors for adapters
 
 import (

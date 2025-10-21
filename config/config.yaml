@@ -23,14 +23,14 @@ security:
 
 rate_limit:
   enabled: true
-  strategy: memory        # memory | redis
+  strategy: redis        # memory | redis
   requests_per_minute: 60 # tokens added per minute
   burst: 30               # bucket size
 
 redis:
   mode: standalone        # standalone | sentinel
-  addresses: ["localhost:6379"]
-  master_name: "mymaster" # used only for sentinel
+  addresses: ["127.0.0.1:6379"]
+  master_name: "" # used only for sentinel
   db: 0
   username: ""
   password: ""

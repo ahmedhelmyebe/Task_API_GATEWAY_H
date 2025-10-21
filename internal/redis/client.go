@@ -1,13 +1,16 @@
+//Universal redis client with quick ping.
+
 package redis // Client init for standalone or sentinel
 
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"time"
 
+	"example.com/api-gateway/config"
 	redis "github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
-	"example.com/api-gateway/config"
 )
 
 // Client is a thin alias to decouple imports.
@@ -21,6 +24,9 @@ func NewClient(cfg config.Redis, log *zap.Logger) (Client, error) {
 		Username: cfg.Username,
 		Password: cfg.Password,
 	}
+	fmt.Println("============TEST CONNECTION OF REDDIS IF IT READS THE ADDRESS OR NOT =============")
+	fmt.Println(opt.Addrs)
+	fmt.Println("=======================66666666666666666666666666==")
 	if cfg.Mode == "sentinel" {
 		opt.MasterName = cfg.MasterName
 	}

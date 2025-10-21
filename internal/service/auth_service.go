@@ -1,3 +1,4 @@
+//Validate login; issue JWT.
 package service // Auth service combines repo + jwt + password
 
 import (

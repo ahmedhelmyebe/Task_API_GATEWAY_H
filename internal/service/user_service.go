@@ -1,3 +1,4 @@
+// CRUD orchestration; calls repo.Update.
 package service // Business logic around users
 
 import (
@@ -32,7 +33,9 @@ func (s *UserService) GetByEmail(email string) (*domain.User, error) { return s.
 func (s *UserService) List(offset, limit int) ([]domain.User, error) { return s.repo.List(offset, limit) }
 
 // Update updates fields.
-func (s *UserService) Update(u *domain.User) error { return s.repo.Update(u) }
+func (s *UserService) Update(u *domain.User) error { 
+	return s.repo.Update(u) 
+}
 
 // Delete removes a user.
 func (s *UserService) Delete(id string) error { return s.repo.Delete(id) }

@@ -1,3 +1,5 @@
+//internal/rate/: Limiter interface + memory and Redis impl.
+
 package rate // Limiter interface and config shim
 
 import (
